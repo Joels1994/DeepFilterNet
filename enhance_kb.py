@@ -10,6 +10,8 @@ Notebook / Colab cell: edit the settings below and run the whole file as one cel
 
 - Any sample rate (16 kHz input is upsampled to 48 kHz internally and converted back).
 - Mono or multi-channel (each channel is processed separately).
+- The input is level-normalised to -25 dBFS (active RMS) before the model, as in training, and the
+  output is scaled back to the original loudness. Disable with --no-normalize.
 - Needs torch + numpy. soundfile, loguru, appdirs and deepfilternet==0.5.6 (model code only)
   are installed automatically on the first run if missing.
 - config.ini (model architecture) is looked up next to best_model.pt, in the DeepFilterNet3_kb/
@@ -23,6 +25,8 @@ CONFIG_INI = None       # None → search automatically (see above)
 OUTPUT_WAV = None       # None → <input>_enhanced.wav
 DEVICE = None           # None → "cuda" if available, else "cpu"
 ATTEN_LIM_DB = None     # e.g. 30 → remove at most 30 dB (sounds more natural); None → no limit
+NORMALIZE_DBFS = -25.0  # input level fed to the model (active RMS, dBFS; training used -35…-15); None → no normalisation.
+                        # The output is scaled back, so it keeps the original file's loudness.
 # ==================================================================
 
 import argparse, configparser, importlib, importlib.util, math, re, shutil, subprocess, sys, time, types, zipfile
@@ -369,14 +373,30 @@ def enhance_audio(model, dsp, x, sr, atten_lim_db=None):
     return y
 
 
-def enhance_file(input_wav, model_pt, output_wav=None, config_ini=None, device=None, atten_lim_db=None):
+def active_rms(x, sr, rel_db=40.0):
+    # RMS over 10 ms frames within rel_db of the loudest frame (all channels together)
+    fr = max(1, int(0.01 * sr))
+    n = x.shape[-1] // fr * fr
+    if n == 0:
+        return float(x.pow(2).mean().sqrt())
+    e = x[..., :n].reshape(x.shape[0], -1, fr).pow(2).mean(-1).mean(0)
+    return float(e[e >= e.max() * 10 ** (-rel_db / 10)].mean().sqrt())
+
+
+def enhance_file(input_wav, model_pt, output_wav=None, config_ini=None, device=None, atten_lim_db=None,
+                 normalize_dbfs=NORMALIZE_DBFS):
     device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
     cfg = find_config(model_pt, config_ini)
     model, dsp = load_model(model_pt, cfg, device)
     x, sr = sf.read(str(input_wav), dtype="float32", always_2d=True)       # [L, C]
     xt = torch.from_numpy(np.ascontiguousarray(x.T)).to(device)            # [C, L]
+    gain = 1.0
+    if normalize_dbfs is not None:
+        rms, peak = active_rms(xt, sr), float(xt.abs().max())
+        if rms > 1e-8:
+            gain = min(10 ** (normalize_dbfs / 20) / rms, 0.99 / max(peak, 1e-8))   # target level, no clipping
     t0 = time.time()
-    y = enhance_audio(model, dsp, xt, sr, atten_lim_db)
+    y = enhance_audio(model, dsp, xt * gain, sr, atten_lim_db) / gain              # back to the original level
     if device.type == "cuda":
         torch.cuda.synchronize()
     dt = time.time() - t0
@@ -384,7 +404,8 @@ def enhance_file(input_wav, model_pt, output_wav=None, config_ini=None, device=N
     y = y.clamp(-1.0, 1.0).cpu().numpy().T
     sf.write(str(out), y[:, 0] if y.shape[1] == 1 else y, sr)
     print(f"{input_wav} → {out}  |  {x.shape[0] / sr:.1f} s, {sr} Hz, {x.shape[1]} ch  |  "
-          f"{dt:.2f} s on {device.type} ({x.shape[0] / sr / max(dt, 1e-9):.0f}x real time)  |  config: {cfg}")
+          f"{dt:.2f} s on {device.type} ({x.shape[0] / sr / max(dt, 1e-9):.0f}x real time)  |  "
+          f"input gain {20 * math.log10(gain):+.1f} dB (undone at output)  |  config: {cfg}")
     return out
 
 
@@ -396,8 +417,12 @@ def main():
     ap.add_argument("--out", default=OUTPUT_WAV, help="output file (default: <input>_enhanced.wav)")
     ap.add_argument("--device", default=DEVICE, help="cuda or cpu (default: cuda if available)")
     ap.add_argument("--atten-lim-db", type=float, default=ATTEN_LIM_DB, help="max attenuation in dB (optional)")
+    ap.add_argument("--normalize-dbfs", type=float, default=NORMALIZE_DBFS,
+                    help="level fed to the model, active RMS in dBFS (default -25; output keeps the original level)")
+    ap.add_argument("--no-normalize", action="store_true", help="feed the file to the model at its original level")
     args = ap.parse_args([] if "ipykernel" in sys.modules else None)   # notebook → use the settings above
-    enhance_file(args.input, args.model, args.out, args.config, args.device, args.atten_lim_db)
+    enhance_file(args.input, args.model, args.out, args.config, args.device, args.atten_lim_db,
+                 None if args.no_normalize else args.normalize_dbfs)
 
 
 if __name__ == "__main__":
